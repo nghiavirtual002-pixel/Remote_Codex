@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.env
+
+ai_dev_agent.log
+ai_dev_agent_state.json
+ai_dev_agent_repos.json
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.DS_Store
+Thumbs.db
