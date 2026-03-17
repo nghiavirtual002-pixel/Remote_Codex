@@ -60,6 +60,8 @@ class TelegramTaskBot:
         self.application.add_handler(CommandHandler("branches", self.branches_cmd))
         self.application.add_handler(CommandHandler("gitlog", self.gitlog_cmd))
         self.application.add_handler(CommandHandler("pull", self.pull_cmd))
+        self.application.add_handler(CommandHandler("commit", self.commit_cmd))
+        self.application.add_handler(CommandHandler("push", self.push_cmd))
         self.application.add_handler(CommandHandler("ask", self.ask_cmd))
         self.application.add_handler(CommandHandler("task", self.task_cmd))
         self.application.add_handler(CommandHandler("status", self.status_cmd))
@@ -92,6 +94,8 @@ class TelegramTaskBot:
             "/branches - list local and remote branches\n"
             "/gitlog [n] - show recent commits, default 5\n"
             "/pull [branch] - fetch and pull the selected repo\n"
+            "/commit <message> - safely commit allowed local changes on the selected repo\n"
+            "/push [branch] - push current branch or a specific branch\n"
             "/ask <question> - ask Codex about the current project in read-only mode\n"
             "/task <prompt> - queue a Codex coding task on the selected repo\n"
             "/task --repo <repo> <prompt> - queue a task on a specific repo\n"
@@ -146,6 +150,20 @@ class TelegramTaskBot:
                 "`/pull [branch]`\n\n"
                 "Fetch + pull repo dang chon. Bot se chan lenh nay neu repo dang co task chay, hoac worktree dang ban."
             ),
+            "commit": (
+                "`/commit <message>`\n\n"
+                "Lenh nay chi commit nhung file duoc coi la an toan trong repo dang chon.\n"
+                "Bot se bo qua `.env`, file state, log, key, va cac file co dau hieu chua token/secret.\n"
+                "Phu hop khi ban sua code thu cong hom truoc va quen commit.\n\n"
+                "Vi du:\n"
+                "- `/commit fix api upload bug`\n"
+                "- `/commit initial local changes before task`"
+            ),
+            "push": (
+                "`/push [branch]`\n\n"
+                "Day branch hien tai, hoac branch ban chi dinh, len remote `origin`.\n"
+                "Neu repo dang co task chay thi bot se chan lenh nay de tranh xung dot."
+            ),
             "repoinfo": (
                 "`/repoinfo`\n\n"
                 "Cho ban biet repo dang chon, path local, branch hien tai, remote `origin`, repo co dang ban khong, va trang thai worktree."
@@ -158,6 +176,17 @@ class TelegramTaskBot:
         if len(text) <= limit:
             return text
         return text[:limit] + "\n... (truncated)"
+
+    def _format_blocked_commit_paths(self, blocked_paths, limit: int = 5) -> str:
+        if not blocked_paths:
+            return ""
+        lines = ["Skipped sensitive files:"]
+        for item in blocked_paths[:limit]:
+            lines.append(f"- {item.path} ({item.reason})")
+        remaining = len(blocked_paths) - limit
+        if remaining > 0:
+            lines.append(f"- ... and {remaining} more")
+        return "\n".join(lines)
 
     def _is_authorized(self, update: Update) -> bool:
         chat = update.effective_chat
@@ -565,6 +594,76 @@ class TelegramTaskBot:
         )
         await message.reply_text(response)
 
+    async def commit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_if_unauthorized(update):
+            return
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        commit_message = " ".join(context.args).strip()
+        if not commit_message:
+            await message.reply_text("Usage: /commit <message>")
+            return
+        try:
+            repository_alias, _, git_manager = self._resolve_repo_for_chat(chat.id)
+            self._ensure_repo_not_busy(repository_alias)
+            commit_result = git_manager.commit_all(
+                commit_message,
+                should_stop=lambda: False,
+                block_patterns=self.settings.safe_commit_block_patterns,
+                content_markers=self.settings.safe_commit_content_markers,
+                content_max_bytes=self.settings.safe_commit_content_max_bytes,
+            )
+            branch_name = git_manager.current_branch(lambda: False)
+        except (GitError, RuntimeError, ValueError) as exc:
+            await self._reply_error(message, exc, prefix="Unable to commit")
+            return
+        blocked_text = self._format_blocked_commit_paths(commit_result.blocked_paths)
+        if commit_result.commit_hash is None:
+            response = f"Repo: {repository_alias}\nNo safe file changes to commit."
+            if blocked_text:
+                response = f"{response}\n{blocked_text}"
+            await message.reply_text(response)
+            return
+        response = (
+            f"Repo: {repository_alias}\n"
+            f"Branch: {branch_name}\n"
+            f"Commit: {commit_result.commit_hash}\n"
+            f"Message: {commit_message}\n"
+            f"Safe files included: {len(commit_result.staged_paths)}"
+        )
+        if blocked_text:
+            response = f"{response}\n{blocked_text}"
+        response = f"{response}\nUse /push if you also want to send this commit to remote."
+        await message.reply_text(response)
+
+    async def push_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_if_unauthorized(update):
+            return
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        branch_name = context.args[0].strip() if context.args else None
+        try:
+            repository_alias, _, git_manager = self._resolve_repo_for_chat(chat.id)
+            self._ensure_repo_not_busy(repository_alias)
+            remote_url = git_manager.get_remote_url(lambda: False, self.settings.git_remote)
+            if not remote_url:
+                raise RuntimeError("Remote origin is not configured. Use /setremote first.")
+            push_output = git_manager.push_current_branch(lambda: False, branch_name=branch_name)
+            active_branch = branch_name or git_manager.current_branch(lambda: False)
+        except (GitError, RuntimeError, ValueError) as exc:
+            await self._reply_error(message, exc, prefix="Unable to push")
+            return
+        await message.reply_text(
+            f"Repo: `{repository_alias}`\n"
+            f"Branch: {active_branch}\n"
+            f"Remote: {remote_url}\n"
+            f"Result: {push_output}"
+        )
+
     async def ask_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_if_unauthorized(update):
             return
@@ -670,4 +769,19 @@ class TelegramTaskBot:
 
 if __name__ == "__main__":
     TelegramTaskBot().run()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

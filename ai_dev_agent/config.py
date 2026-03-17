@@ -7,6 +7,42 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_SAFE_COMMIT_BLOCK_PATTERNS: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.kdbx",
+    "*.crt",
+    "*.cer",
+    "*.der",
+    "*.jks",
+    "*id_rsa*",
+    "*id_ed25519*",
+    "ai_dev_agent.log",
+    "ai_dev_agent_state.json",
+    "ai_dev_agent_repos.json",
+    ".venv/*",
+    "__pycache__/*",
+    ".pytest_cache/*",
+    ".mypy_cache/*",
+    ".ruff_cache/*",
+)
+
+DEFAULT_SAFE_COMMIT_CONTENT_MARKERS: tuple[str, ...] = (
+    "TELEGRAM_BOT_TOKEN=",
+    "TELEGRAM_ALLOWED_CHAT_IDS=",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+)
+
 
 @dataclass(slots=True)
 class Settings:
@@ -30,6 +66,9 @@ class Settings:
     allowed_chat_ids: tuple[int, ...] = ()
     auto_stash_when_dirty: bool = False
     auto_stash_include_untracked: bool = True
+    safe_commit_block_patterns: tuple[str, ...] = DEFAULT_SAFE_COMMIT_BLOCK_PATTERNS
+    safe_commit_content_markers: tuple[str, ...] = DEFAULT_SAFE_COMMIT_CONTENT_MARKERS
+    safe_commit_content_max_bytes: int = 200_000
 
     @property
     def repository_path(self) -> Path:
@@ -103,6 +142,17 @@ def _parse_bool(raw: str, default: bool) -> bool:
     if value in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _parse_pattern_list(raw: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not raw.strip():
+        return default
+    values = [
+        part.strip()
+        for part in re.split(r"[,\n;]+", raw)
+        if part.strip()
+    ]
+    return tuple(values) if values else default
 
 
 def normalize_repository_alias(alias: str) -> str:
@@ -211,6 +261,15 @@ def load_settings() -> Settings:
         allowed_chat_ids=_parse_allowed_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")),
         auto_stash_when_dirty=_parse_bool(os.getenv("AUTO_STASH_WHEN_DIRTY", ""), default=False),
         auto_stash_include_untracked=_parse_bool(os.getenv("AUTO_STASH_INCLUDE_UNTRACKED", ""), default=True),
+        safe_commit_block_patterns=_parse_pattern_list(
+            os.getenv("SAFE_COMMIT_BLOCK_PATTERNS", ""),
+            DEFAULT_SAFE_COMMIT_BLOCK_PATTERNS,
+        ),
+        safe_commit_content_markers=_parse_pattern_list(
+            os.getenv("SAFE_COMMIT_CONTENT_MARKERS", ""),
+            DEFAULT_SAFE_COMMIT_CONTENT_MARKERS,
+        ),
+        safe_commit_content_max_bytes=int(os.getenv("SAFE_COMMIT_CONTENT_MAX_BYTES", "200000")),
     )
 
 

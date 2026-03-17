@@ -156,6 +156,17 @@ class Worker(threading.Thread):
                 return True
         return False
 
+    def _format_blocked_commit_paths(self, blocked_paths, limit: int = 5) -> str:
+        if not blocked_paths:
+            return ""
+        lines = ["Skipped sensitive files:"]
+        for item in blocked_paths[:limit]:
+            lines.append(f"- {item.path} ({item.reason})")
+        remaining = len(blocked_paths) - limit
+        if remaining > 0:
+            lines.append(f"- ... and {remaining} more")
+        return "\n".join(lines)
+
     def _finalize_and_publish(
         self,
         task: TaskRecord,
@@ -164,12 +175,22 @@ class Worker(threading.Thread):
     ) -> tuple[str, str | None, str]:
         self._ensure_not_stopped(task)
         self.task_manager.update_progress(task.task_id, "Committing changes")
-        commit_hash = git_manager.commit_all("AI task result", self._should_stop_factory(task.task_id))
+        commit_result = git_manager.commit_all(
+            "AI task result",
+            self._should_stop_factory(task.task_id),
+            block_patterns=self.settings.safe_commit_block_patterns,
+            content_markers=self.settings.safe_commit_content_markers,
+            content_max_bytes=self.settings.safe_commit_content_max_bytes,
+        )
+        blocked_text = self._format_blocked_commit_paths(commit_result.blocked_paths)
+        commit_hash = commit_result.commit_hash
         if commit_hash is None:
             summary = (
                 f"Task `{task.task_id}` finished on repo `{task.repository_alias}` branch `{branch_name}`.\n"
-                "No file changes were produced, so commit/push were skipped."
+                "No safe file changes were produced, so commit/push were skipped."
             )
+            if blocked_text:
+                summary = f"{summary}\n{blocked_text}"
             return summary, None, "No commit diff available (no changes)."
 
         self._ensure_not_stopped(task)
@@ -191,6 +212,8 @@ class Worker(threading.Thread):
             f"Lines added: {lines_added}\n"
             f"Lines removed: {lines_removed}"
         )
+        if blocked_text:
+            summary = f"{summary}\n{blocked_text}"
         return summary, commit_hash, diff
 
     def _ensure_not_stopped(self, task: TaskRecord) -> None:

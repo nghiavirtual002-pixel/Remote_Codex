@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -7,6 +9,19 @@ try:
     from .codex_runner import CommandResult, run_command
 except ImportError:
     from codex_runner import CommandResult, run_command
+
+
+@dataclass(slots=True)
+class BlockedCommitPath:
+    path: str
+    reason: str
+
+
+@dataclass(slots=True)
+class CommitResult:
+    commit_hash: str | None
+    staged_paths: tuple[str, ...] = ()
+    blocked_paths: tuple[BlockedCommitPath, ...] = ()
 
 
 class GitError(RuntimeError):
@@ -20,6 +35,104 @@ class GitManager:
 
     def _git(self, args: list[str], should_stop: Callable[[], bool]) -> CommandResult:
         return run_command(["git", *args], cwd=self.repo_path, should_stop=should_stop)
+
+    def _list_paths(self, args: list[str], should_stop: Callable[[], bool], error_message: str) -> list[str]:
+        result = self._git(args, should_stop=should_stop)
+        if result.returncode != 0:
+            raise GitError(result.output.strip() or error_message)
+        return [part for part in result.output.split("\0") if part]
+
+    def _changed_paths(self, should_stop: Callable[[], bool]) -> list[str]:
+        ordered_paths: dict[str, None] = {}
+        sources = [
+            self._list_paths(
+                ["diff", "--name-only", "-z", "--"],
+                should_stop=should_stop,
+                error_message="Failed to inspect unstaged changes",
+            ),
+            self._list_paths(
+                ["diff", "--cached", "--name-only", "-z", "--"],
+                should_stop=should_stop,
+                error_message="Failed to inspect staged changes",
+            ),
+            self._list_paths(
+                ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+                should_stop=should_stop,
+                error_message="Failed to inspect untracked files",
+            ),
+        ]
+        for group in sources:
+            for rel_path in group:
+                ordered_paths[rel_path] = None
+        return list(ordered_paths)
+
+    def _staged_paths(self, should_stop: Callable[[], bool]) -> set[str]:
+        return set(
+            self._list_paths(
+                ["diff", "--cached", "--name-only", "-z", "--"],
+                should_stop=should_stop,
+                error_message="Failed to inspect staged changes",
+            )
+        )
+
+    def _matches_block_pattern(self, rel_path: str, block_patterns: tuple[str, ...]) -> str | None:
+        normalized_path = rel_path.replace("\\", "/")
+        file_name = Path(normalized_path).name
+        for pattern in block_patterns:
+            if fnmatch(normalized_path, pattern) or fnmatch(file_name, pattern):
+                return pattern
+        return None
+
+    def _contains_sensitive_content(
+        self,
+        rel_path: str,
+        content_markers: tuple[str, ...],
+        content_max_bytes: int,
+    ) -> str | None:
+        target_path = (self.repo_path / rel_path).resolve()
+        if not target_path.exists() or not target_path.is_file():
+            return None
+
+        try:
+            file_size = target_path.stat().st_size
+            if file_size > content_max_bytes:
+                return None
+            content = target_path.read_bytes()
+        except OSError:
+            return None
+
+        lowered_content = content.lower()
+        for marker in content_markers:
+            marker_bytes = marker.encode("utf-8", errors="ignore")
+            if marker_bytes and marker_bytes.lower() in lowered_content:
+                return marker
+        return None
+
+    def _blocked_commit_path(
+        self,
+        rel_path: str,
+        block_patterns: tuple[str, ...],
+        content_markers: tuple[str, ...],
+        content_max_bytes: int,
+    ) -> BlockedCommitPath | None:
+        pattern = self._matches_block_pattern(rel_path, block_patterns)
+        if pattern:
+            return BlockedCommitPath(rel_path, f"matches protected pattern `{pattern}`")
+
+        marker = self._contains_sensitive_content(rel_path, content_markers, content_max_bytes)
+        if marker:
+            return BlockedCommitPath(rel_path, f"contains sensitive marker `{marker}`")
+        return None
+
+    def _stage_paths(self, paths: list[str], should_stop: Callable[[], bool]) -> None:
+        if not paths:
+            return
+        batch_size = 50
+        for index in range(0, len(paths), batch_size):
+            batch = paths[index : index + batch_size]
+            result = self._git(["add", "-A", "--", *batch], should_stop=should_stop)
+            if result.returncode != 0:
+                raise GitError(result.output.strip() or "git add failed")
 
     def ensure_repository(self) -> None:
         if not (self.repo_path / ".git").exists():
@@ -76,6 +189,11 @@ class GitManager:
         if result.returncode != 0:
             raise GitError(result.output.strip() or f"git pull failed for {self.remote}/{branch}")
         return result.output.strip() or f"Already up to date with {self.remote}/{branch}"
+
+    def push_current_branch(self, should_stop: Callable[[], bool], branch_name: str | None = None) -> str:
+        branch = branch_name or self.current_branch(should_stop)
+        self.push_branch(branch, should_stop=should_stop)
+        return f"Pushed branch {branch} to {self.remote}"
 
     def get_remote_url(self, should_stop: Callable[[], bool], remote_name: str | None = None) -> str | None:
         remote = remote_name or self.remote
@@ -142,13 +260,51 @@ class GitManager:
             raise GitError(result.output.strip() or "Failed to query git status")
         return bool(result.output.strip())
 
-    def commit_all(self, message: str, should_stop: Callable[[], bool]) -> Optional[str]:
-        add_result = self._git(["add", "."], should_stop=should_stop)
-        if add_result.returncode != 0:
-            raise GitError(add_result.output.strip() or "git add failed")
+    def has_staged_changes(self, should_stop: Callable[[], bool]) -> bool:
+        return bool(self._staged_paths(should_stop=should_stop))
 
-        if not self.has_changes(should_stop=should_stop):
-            return None
+    def commit_all(
+        self,
+        message: str,
+        should_stop: Callable[[], bool],
+        block_patterns: tuple[str, ...] = (),
+        content_markers: tuple[str, ...] = (),
+        content_max_bytes: int = 200_000,
+    ) -> CommitResult:
+        changed_paths = self._changed_paths(should_stop=should_stop)
+        blocked_paths: list[BlockedCommitPath] = []
+        allowed_paths: list[str] = []
+
+        for rel_path in changed_paths:
+            blocked = self._blocked_commit_path(
+                rel_path,
+                block_patterns=block_patterns,
+                content_markers=content_markers,
+                content_max_bytes=content_max_bytes,
+            )
+            if blocked is not None:
+                blocked_paths.append(blocked)
+            else:
+                allowed_paths.append(rel_path)
+
+        staged_paths = self._staged_paths(should_stop=should_stop)
+        blocked_staged = [item.path for item in blocked_paths if item.path in staged_paths]
+        if blocked_staged:
+            blocked_preview = ", ".join(blocked_staged[:5])
+            suffix = "" if len(blocked_staged) <= 5 else ", ..."
+            raise GitError(
+                "Sensitive files are already staged and would be unsafe to commit. "
+                f"Please unstage them first: {blocked_preview}{suffix}"
+            )
+
+        self._stage_paths(allowed_paths, should_stop=should_stop)
+
+        if not self.has_staged_changes(should_stop=should_stop):
+            return CommitResult(
+                commit_hash=None,
+                staged_paths=tuple(allowed_paths),
+                blocked_paths=tuple(blocked_paths),
+            )
 
         commit_result = self._git(["commit", "-m", message], should_stop=should_stop)
         if commit_result.returncode != 0:
@@ -157,7 +313,11 @@ class GitManager:
         hash_result = self._git(["rev-parse", "HEAD"], should_stop=should_stop)
         if hash_result.returncode != 0:
             raise GitError(hash_result.output.strip() or "Failed to read commit hash")
-        return hash_result.output.strip().splitlines()[-1]
+        return CommitResult(
+            commit_hash=hash_result.output.strip().splitlines()[-1],
+            staged_paths=tuple(allowed_paths),
+            blocked_paths=tuple(blocked_paths),
+        )
 
     def push_branch(self, branch_name: str, should_stop: Callable[[], bool]) -> None:
         result = self._git(["push", "-u", self.remote, branch_name], should_stop=should_stop)
