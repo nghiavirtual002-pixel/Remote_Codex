@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -159,11 +159,14 @@ class GitManager:
         if not (self.repo_path / ".git").exists():
             raise GitError(f"Not a git repository: {self.repo_path}")
 
-    def ensure_clean_worktree(self, should_stop: Callable[[], bool]) -> None:
+    def has_uncommitted_changes(self, should_stop: Callable[[], bool]) -> bool:
         result = self._git(["status", "--porcelain"], should_stop=should_stop)
         if result.returncode != 0:
             raise GitError(result.output.strip() or "Failed to query git status")
-        if result.output.strip():
+        return bool(result.output.strip())
+
+    def ensure_clean_worktree(self, should_stop: Callable[[], bool]) -> None:
+        if self.has_uncommitted_changes(should_stop=should_stop):
             raise GitError(
                 "Repository has uncommitted changes. Commit/stash before starting task "
                 "or enable AUTO_STASH_WHEN_DIRTY=true."
@@ -409,3 +412,4 @@ class GitManager:
         if len(diff) > max_chars:
             return diff[:max_chars] + "\n... (truncated)"
         return diff
+

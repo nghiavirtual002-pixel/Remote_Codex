@@ -81,8 +81,9 @@ class Worker(threading.Thread):
 
     def _process_fresh_task(self, task: TaskRecord, repo_alias: str, repo_path: Path, git_manager: GitManager) -> None:
         self._ensure_not_stopped(task)
-        self._prepare_clean_worktree(task, git_manager)
-        self._sync_repo_to_task_base(task, git_manager)
+        preserve_local_changes = self._prepare_clean_worktree(task, git_manager)
+        if not preserve_local_changes:
+            self._sync_repo_to_task_base(task, git_manager)
 
         branch_name = self._build_branch_name(repo_alias)
         self.task_manager.set_branch(task.task_id, branch_name)
@@ -137,11 +138,19 @@ class Worker(threading.Thread):
             detail = result.last_agent_message.strip() or f"Codex command failed with code {result.returncode}"
             raise RuntimeError(detail)
 
-    def _prepare_clean_worktree(self, task: TaskRecord, git_manager: GitManager) -> None:
+    def _prepare_clean_worktree(self, task: TaskRecord, git_manager: GitManager) -> bool:
         should_stop = self._should_stop_factory(task.task_id)
         if not self.settings.auto_stash_when_dirty:
-            git_manager.ensure_clean_worktree(should_stop)
-            return
+            if git_manager.has_uncommitted_changes(should_stop=should_stop):
+                message = (
+                    f"Repository `{task.repository_alias}` has local changes. "
+                    "Continuing the task on the current worktree without auto-stash."
+                )
+                self.task_manager.update_progress(task.task_id, "Using existing local changes as the task base")
+                self.task_manager.enqueue_notification(task.chat_id, message)
+                self.task_manager.append_output_line(task.task_id, message)
+                return True
+            return False
 
         self.task_manager.update_progress(task.task_id, "Checking repository status for auto-stash")
         stash_ref = git_manager.stash_if_dirty(
@@ -157,6 +166,7 @@ class Worker(threading.Thread):
             self.task_manager.enqueue_notification(task.chat_id, message)
             self.task_manager.append_output_line(task.task_id, message)
         git_manager.ensure_clean_worktree(should_stop)
+        return False
 
     def _sync_repo_to_task_base(self, task: TaskRecord, git_manager: GitManager) -> None:
         target_branch = self.settings.auto_sync_main_branch.strip() or "main"
@@ -321,3 +331,5 @@ class TaskNeedsInput(RuntimeError):
         super().__init__(question)
         self.question = question
         self.thread_id = thread_id
+
+
