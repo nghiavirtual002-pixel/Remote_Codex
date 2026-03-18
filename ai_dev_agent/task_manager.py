@@ -35,6 +35,7 @@ class TaskRecord:
     codex_thread_id: Optional[str] = None
     pending_confirmation: Optional[str] = None
     resume_prompt: Optional[str] = None
+    baseline_snapshot: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +184,14 @@ class TaskManager:
             if task is None:
                 return
             task.codex_thread_id = thread_id
+            self._persist()
+
+    def set_baseline_snapshot(self, task_id: str, snapshot: dict[str, str]) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.baseline_snapshot = dict(snapshot)
             self._persist()
 
     def mark_waiting_input(self, task_id: str, question: str, thread_id: str | None) -> None:
@@ -421,4 +430,5 @@ class TaskManager:
             except queue.Empty:
                 break
         return items
+
 

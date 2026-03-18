@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from fnmatch import fnmatch
 from pathlib import Path
 import re
@@ -155,6 +156,24 @@ class GitManager:
             if result.returncode != 0:
                 raise GitError(result.output.strip() or "git add failed")
 
+    def _snapshot_value(self, rel_path: str) -> str:
+        target_path = (self.repo_path / rel_path).resolve()
+        if not target_path.exists():
+            return "missing"
+        if not target_path.is_file():
+            return "non-file"
+        try:
+            data = target_path.read_bytes()
+        except OSError:
+            return "unreadable"
+        digest = hashlib.sha256(data).hexdigest()
+        return f"file:{len(data)}:{digest}"
+
+    def capture_change_snapshot(self, should_stop: Callable[[], bool]) -> dict[str, str]:
+        snapshot: dict[str, str] = {}
+        for rel_path in self._changed_paths(should_stop=should_stop):
+            snapshot[rel_path] = self._snapshot_value(rel_path)
+        return snapshot
     def ensure_repository(self) -> None:
         if not (self.repo_path / ".git").exists():
             raise GitError(f"Not a git repository: {self.repo_path}")
@@ -412,4 +431,5 @@ class GitManager:
         if len(diff) > max_chars:
             return diff[:max_chars] + "\n... (truncated)"
         return diff
+
 

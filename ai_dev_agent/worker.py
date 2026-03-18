@@ -89,6 +89,9 @@ class Worker(threading.Thread):
         self.task_manager.set_branch(task.task_id, branch_name)
         self.task_manager.update_progress(task.task_id, f"Creating branch {branch_name} in repo {repo_alias}")
         git_manager.checkout_new_branch(branch_name, self._should_stop_factory(task.task_id))
+        baseline_snapshot = git_manager.capture_change_snapshot(self._should_stop_factory(task.task_id))
+        task.baseline_snapshot = baseline_snapshot
+        self.task_manager.set_baseline_snapshot(task.task_id, baseline_snapshot)
         self.task_manager.enqueue_notification(
             task.chat_id,
             f"Task `{task.task_id}` running on repo `{repo_alias}` branch `{branch_name}`",
@@ -266,6 +269,13 @@ class Worker(threading.Thread):
         git_manager: GitManager,
     ) -> tuple[str, str | None, str]:
         self._ensure_not_stopped(task)
+        current_snapshot = git_manager.capture_change_snapshot(self._should_stop_factory(task.task_id))
+        baseline_snapshot = dict(task.baseline_snapshot)
+        if current_snapshot == baseline_snapshot:
+            raise RuntimeError(
+                "Task did not create any new changes beyond the existing local worktree. "
+                "Nothing new was produced to commit."
+            )
         self.task_manager.update_progress(task.task_id, "Committing changes")
         commit_result = git_manager.commit_all(
             "AI task result",
@@ -331,5 +341,7 @@ class TaskNeedsInput(RuntimeError):
         super().__init__(question)
         self.question = question
         self.thread_id = thread_id
+
+
 
 
