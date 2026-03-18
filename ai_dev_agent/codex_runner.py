@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -261,7 +261,10 @@ def run_codex_session(
     resolved = resolve_codex_binary(codex_binary)
     effective_prompt = _build_confirmation_prompt(prompt, read_only=read_only)
     if session_id:
-        command = [resolved, "exec", "resume", "--json", session_id, effective_prompt]
+        if read_only:
+            command = [resolved, "exec", "resume", "--json", session_id, effective_prompt]
+        else:
+            command = [resolved, "exec", "resume", "--json", "--full-auto", session_id, effective_prompt]
     else:
         command = [resolved, "exec", "--json", "--full-auto", "--sandbox", sandbox_mode, effective_prompt]
 
@@ -322,3 +325,4 @@ def discover_test_commands(repo_path: Path) -> list[list[str]]:
         candidates.append(["go", "test", "./..."])
 
     return candidates
+
