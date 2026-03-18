@@ -275,6 +275,42 @@ class GitManager:
         if result.returncode != 0:
             raise GitError(result.output.strip() or f"Failed to create branch {branch_name}")
 
+    def local_branch_exists(self, branch_name: str, should_stop: Callable[[], bool]) -> bool:
+        result = self._git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"], should_stop=should_stop)
+        if result.returncode in {0, 1}:
+            return result.returncode == 0
+        raise GitError(result.output.strip() or f"Failed to inspect local branch {branch_name}")
+
+    def remote_branch_exists(self, branch_name: str, should_stop: Callable[[], bool]) -> bool:
+        result = self._git(
+            ["show-ref", "--verify", "--quiet", f"refs/remotes/{self.remote}/{branch_name}"],
+            should_stop=should_stop,
+        )
+        if result.returncode in {0, 1}:
+            return result.returncode == 0
+        raise GitError(result.output.strip() or f"Failed to inspect remote branch {self.remote}/{branch_name}")
+
+    def checkout_branch(self, branch_name: str, should_stop: Callable[[], bool]) -> str:
+        if self.current_branch(should_stop) == branch_name:
+            return f"Already on {branch_name}"
+
+        if self.local_branch_exists(branch_name, should_stop=should_stop):
+            result = self._git(["checkout", branch_name], should_stop=should_stop)
+        elif self.remote_branch_exists(branch_name, should_stop=should_stop):
+            result = self._git(["checkout", "-b", branch_name, "--track", f"{self.remote}/{branch_name}"], should_stop=should_stop)
+        else:
+            raise GitError(f"Branch {branch_name} does not exist locally or on {self.remote}")
+
+        if result.returncode != 0:
+            raise GitError(result.output.strip() or f"Failed to checkout branch {branch_name}")
+        return result.output.strip() or f"Checked out {branch_name}"
+
+    def sync_branch(self, branch_name: str, should_stop: Callable[[], bool]) -> tuple[str, str, str]:
+        fetch_output = self.fetch(should_stop=should_stop)
+        checkout_output = self.checkout_branch(branch_name, should_stop=should_stop)
+        pull_output = self.pull_current_branch(should_stop=should_stop, branch_name=branch_name)
+        return fetch_output, checkout_output, pull_output
+
     def has_changes(self, should_stop: Callable[[], bool]) -> bool:
         result = self._git(["status", "--porcelain"], should_stop=should_stop)
         if result.returncode != 0:
@@ -373,4 +409,3 @@ class GitManager:
         if len(diff) > max_chars:
             return diff[:max_chars] + "\n... (truncated)"
         return diff
-

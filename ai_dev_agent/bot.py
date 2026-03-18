@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import logging
@@ -7,20 +7,20 @@ from pathlib import Path
 from typing import Final
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Message, Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 try:
-    from .codex_runner import run_codex
+    from .codex_runner import CodexRunResult, run_codex_session
     from .config import configure_logging, load_settings
     from .git_manager import GitError, GitManager
-    from .task_manager import TaskManager
+    from .task_manager import PendingCodexSession, TaskManager
     from .worker import Worker
 except ImportError:
-    from codex_runner import run_codex
+    from codex_runner import CodexRunResult, run_codex_session
     from config import configure_logging, load_settings
     from git_manager import GitError, GitManager
-    from task_manager import TaskManager
+    from task_manager import PendingCodexSession, TaskManager
     from worker import Worker
 
 LOGGER: Final = logging.getLogger("ai_dev_agent.bot")
@@ -60,10 +60,13 @@ class TelegramTaskBot:
         self.application.add_handler(CommandHandler("branches", self.branches_cmd))
         self.application.add_handler(CommandHandler("gitlog", self.gitlog_cmd))
         self.application.add_handler(CommandHandler("pull", self.pull_cmd))
+        self.application.add_handler(CommandHandler("syncmain", self.syncmain_cmd))
         self.application.add_handler(CommandHandler("commit", self.commit_cmd))
         self.application.add_handler(CommandHandler("push", self.push_cmd))
         self.application.add_handler(CommandHandler("ask", self.ask_cmd))
         self.application.add_handler(CommandHandler("task", self.task_cmd))
+        self.application.add_handler(CommandHandler("approve", self.approve_cmd))
+        self.application.add_handler(CommandHandler("deny", self.deny_cmd))
         self.application.add_handler(CommandHandler("status", self.status_cmd))
         self.application.add_handler(CommandHandler("diff", self.diff_cmd))
         self.application.add_handler(CommandHandler("stop", self.stop_cmd))
@@ -94,11 +97,14 @@ class TelegramTaskBot:
             "/branches - list local and remote branches\n"
             "/gitlog [n] - show recent commits, default 5\n"
             "/pull [branch] - fetch and pull the selected repo\n"
+            "/syncmain - checkout and pull the configured main branch\n"
             "/commit <message> - safely commit allowed local changes on the selected repo\n"
             "/push [branch] - push current branch or a specific branch\n"
             "/ask <question> - ask Codex about the current project in read-only mode\n"
             "/task <prompt> - queue a Codex coding task on the selected repo\n"
             "/task --repo <repo> <prompt> - queue a task on a specific repo\n"
+            "/approve <task-or-ask-id> [message] - approve a pending Codex confirmation\n"
+            "/deny <task-or-ask-id> [reason] - deny a pending Codex confirmation\n"
             "/status - show current worker status\n"
             "/diff - show diff from latest completed task\n"
             "/stop - request stop for the running task"
@@ -135,7 +141,8 @@ class TelegramTaskBot:
             "ask": (
                 "`/ask <question>`\n\n"
                 "Lenh nay chay Codex o che do read-only tren repo dang chon de tra loi cau hoi ve du an.\n"
-                "Phu hop de hoi ve luong xu ly, file lien quan, module nao goi module nao, logic business, diem can sua.\n\n"
+                "Phu hop de hoi ve luong xu ly, file lien quan, module nao goi module nao, logic business, diem can sua.\n"
+                "Neu Codex gap mot quyet dinh can ban xac nhan, bot se tra ve `ask-...` va cho ban dung `/approve` hoac `/deny`.\n\n"
                 "Vi du:\n"
                 "- `/ask luong login di qua nhung file nao?`\n"
                 "- `/ask api upload anh duoc goi tu dau?`\n"
@@ -144,11 +151,16 @@ class TelegramTaskBot:
             "task": (
                 "`/task <prompt>` hoac `/task --repo <repo_alias> <prompt>`\n\n"
                 "Lenh nay giao Codex sua code tren repo dang chon, tu dong tao branch task, chay test neu co, commit va push.\n"
-                "Neu repo moi da duoc gan `origin` dung cach thi push se len duoc ngay sau khi task xong."
+                "Neu Codex can ban chap thuan mot hanh dong, task se chuyen sang trang thai `waiting_input` va bot se huong dan ban dung `/approve` hoac `/deny` de tiep tuc cung session do."
             ),
             "pull": (
                 "`/pull [branch]`\n\n"
-                "Fetch + pull repo dang chon. Bot se chan lenh nay neu repo dang co task chay, hoac worktree dang ban."
+                "Fetch + pull repo dang chon. Bot se chan lenh nay neu repo dang co task chay, hoac dang doi xac nhan de tranh xung dot worktree."
+            ),
+            "syncmain": (
+                "`/syncmain`\n\n"
+                "Checkout nhanh branch duoc cau hinh trong `AUTO_SYNC_MAIN_BRANCH` roi fetch + pull ve local.\n"
+                "Phu hop sau khi ban vua merge branch task tren GitHub va muon may local cua bot cap nhat ngay."
             ),
             "commit": (
                 "`/commit <message>`\n\n"
@@ -162,7 +174,22 @@ class TelegramTaskBot:
             "push": (
                 "`/push [branch]`\n\n"
                 "Day branch hien tai, hoac branch ban chi dinh, len remote `origin`.\n"
-                "Neu repo dang co task chay thi bot se chan lenh nay de tranh xung dot."
+                "Neu repo dang co task chay hoac dang doi xac nhan thi bot se chan lenh nay de tranh xung dot."
+            ),
+            "approve": (
+                "`/approve <task-or-ask-id> [message]`\n\n"
+                "Dung lenh nay khi bot bao Codex can ban xac nhan.\n"
+                "- voi `task-...`: bot se dua phan hoi cua ban vao chinh session Codex dang sua code va cho task chay tiep\n"
+                "- voi `ask-...`: bot se tiep tuc phien doc repo read-only va gui cau tra loi sau khi xu ly xong\n\n"
+                "Vi du:\n"
+                "- `/approve task-1773836013501`\n"
+                "- `/approve task-1773836013501 cho phep chay lenh nay`\n"
+                "- `/approve ask-1773836013999 tiep tuc doc them file nay`"
+            ),
+            "deny": (
+                "`/deny <task-or-ask-id> [reason]`\n\n"
+                "Dung lenh nay khi ban khong muon Codex thuc hien hanh dong vua duoc hoi.\n"
+                "Bot se resume session voi thong diep tu choi, de Codex giai thich blocker hoac chon cach an toan hon."
             ),
             "repoinfo": (
                 "`/repoinfo`\n\n"
@@ -188,6 +215,28 @@ class TelegramTaskBot:
             lines.append(f"- ... and {remaining} more")
         return "\n".join(lines)
 
+    def _format_confirmation_request(self, request_id: str, question: str) -> str:
+        return (
+            f"Codex needs your confirmation for `{request_id}`.\n"
+            f"Question: {question}\n\n"
+            f"Approve: `/approve {request_id}`\n"
+            f"Approve with note: `/approve {request_id} <message>`\n"
+            f"Deny: `/deny {request_id} <reason>`"
+        )
+
+    def _build_resume_prompt(self, approved: bool, note: str) -> str:
+        clean_note = note.strip()
+        if approved:
+            prompt = "User approved the previously requested action. Continue safely and keep going."
+        else:
+            prompt = (
+                "User denied the previously requested action. Do not perform it. "
+                "Choose a safe alternative if possible, or explain clearly what is blocked."
+            )
+        if clean_note:
+            prompt = f"{prompt}\n\nUser note: {clean_note}"
+        return prompt
+
     def _is_authorized(self, update: Update) -> bool:
         chat = update.effective_chat
         if chat is None:
@@ -203,6 +252,15 @@ class TelegramTaskBot:
             await update.effective_message.reply_text("Unauthorized chat. Configure TELEGRAM_ALLOWED_CHAT_IDS.")
         return True
 
+    async def _send_to_session_chat(self, message: Message | None, chat_id: int, text: str) -> None:
+        current_chat_id = message.chat_id if message is not None else None
+        if current_chat_id == chat_id and message is not None:
+            await message.reply_text(text)
+            return
+        await self.application.bot.send_message(chat_id=chat_id, text=text)
+        if message is not None:
+            await message.reply_text(f"Response sent to chat `{chat_id}`.")
+
     def _selected_repo_alias(self, chat_id: int) -> str:
         return self.task_manager.get_selected_repo(chat_id, self.settings.default_repository_alias)
 
@@ -215,7 +273,7 @@ class TelegramTaskBot:
 
     def _ensure_repo_not_busy(self, repository_alias: str) -> None:
         if self.task_manager.is_repo_busy(repository_alias):
-            raise RuntimeError(f"Repository `{repository_alias}` is busy with a running task")
+            raise RuntimeError(f"Repository `{repository_alias}` is busy with a running or waiting task")
 
     def _format_repo_list(self, chat_id: int) -> str:
         selected_alias = self._selected_repo_alias(chat_id)
@@ -347,7 +405,7 @@ class TelegramTaskBot:
 
         return self.settings.register_repository(alias, repo_path)
 
-    def _ask_project_sync(self, repo_path: Path, question: str) -> str:
+    def _ask_project_sync(self, repo_path: Path, question: str) -> CodexRunResult:
         prompt = (
             "You are reading the current repository in read-only mode. "
             "Answer the user's question using the project files in this repo. "
@@ -355,19 +413,73 @@ class TelegramTaskBot:
             "If the answer is uncertain, say what is missing.\n\n"
             f"User question: {question.strip()}"
         )
-        result = run_codex(
+        result = run_codex_session(
             codex_binary=self.settings.codex_binary,
             prompt=prompt,
             cwd=repo_path,
             should_stop=lambda: False,
             sandbox_mode="read-only",
+            read_only=True,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"Codex ask failed with code {result.returncode}")
-        answer = result.output.strip()
+        if result.returncode != 0 and not result.confirmation_request:
+            detail = result.last_agent_message.strip() or f"Codex ask failed with code {result.returncode}"
+            raise RuntimeError(detail)
+        if not result.confirmation_request and not result.last_agent_message.strip():
+            raise RuntimeError("Codex returned no answer")
+        return result
+
+    def _resume_ask_sync(self, repo_path: Path, session: PendingCodexSession, resume_prompt: str) -> CodexRunResult:
+        result = run_codex_session(
+            codex_binary=self.settings.codex_binary,
+            prompt=resume_prompt,
+            cwd=repo_path,
+            should_stop=lambda: False,
+            sandbox_mode="read-only",
+            session_id=session.codex_thread_id,
+            read_only=True,
+        )
+        if result.returncode != 0 and not result.confirmation_request:
+            detail = result.last_agent_message.strip() or f"Codex ask resume failed with code {result.returncode}"
+            raise RuntimeError(detail)
+        if not result.confirmation_request and not result.last_agent_message.strip():
+            raise RuntimeError("Codex returned no answer")
+        return result
+
+    async def _deliver_ask_result(
+        self,
+        message: Message | None,
+        chat_id: int,
+        repository_alias: str,
+        question: str,
+        result: CodexRunResult,
+    ) -> None:
+        if result.confirmation_request:
+            thread_id = result.thread_id
+            if not thread_id:
+                raise RuntimeError("Codex asked for confirmation but did not return a session id")
+            pending = self.task_manager.create_pending_session(
+                chat_id=chat_id,
+                repository_alias=repository_alias,
+                kind="ask",
+                prompt=question,
+                codex_thread_id=thread_id,
+                pending_confirmation=result.confirmation_request,
+            )
+            await self._send_to_session_chat(
+                message,
+                chat_id,
+                self._format_confirmation_request(pending.session_id, pending.pending_confirmation),
+            )
+            return
+
+        answer = result.last_agent_message.strip()
         if not answer:
             raise RuntimeError("Codex returned no answer")
-        return answer
+        await self._send_to_session_chat(
+            message,
+            chat_id,
+            f"Repo: `{repository_alias}`\n{self._truncate(answer, 3800)}",
+        )
 
     async def _reply_error(self, message, exc: Exception, prefix: str = "Error") -> None:
         await message.reply_text(f"{prefix}: {exc}")
@@ -594,6 +706,31 @@ class TelegramTaskBot:
         )
         await message.reply_text(response)
 
+    async def syncmain_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_if_unauthorized(update):
+            return
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        try:
+            repository_alias, _, git_manager = self._resolve_repo_for_chat(chat.id)
+            self._ensure_repo_not_busy(repository_alias)
+            git_manager.ensure_clean_worktree(lambda: False)
+            target_branch = self.settings.auto_sync_main_branch.strip() or "main"
+            fetch_output, checkout_output, pull_output = git_manager.sync_branch(target_branch, lambda: False)
+        except (GitError, RuntimeError, ValueError) as exc:
+            await self._reply_error(message, exc, prefix="Unable to sync main")
+            return
+        response = (
+            f"Repo: `{repository_alias}`\n"
+            f"Branch: {target_branch}\n"
+            f"Fetch:\n{self._truncate(fetch_output, 1000)}\n\n"
+            f"Checkout:\n{self._truncate(checkout_output, 1000)}\n\n"
+            f"Pull:\n{self._truncate(pull_output, 1000)}"
+        )
+        await message.reply_text(response)
+
     async def commit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_if_unauthorized(update):
             return
@@ -683,11 +820,10 @@ class TelegramTaskBot:
 
         await message.reply_text(f"Codex is reading repo `{repository_alias}` to answer your question...")
         try:
-            answer = await asyncio.to_thread(self._ask_project_sync, repo_path, question)
+            result = await asyncio.to_thread(self._ask_project_sync, repo_path, question)
+            await self._deliver_ask_result(message, chat.id, repository_alias, question, result)
         except (RuntimeError, ValueError) as exc:
             await self._reply_error(message, exc, prefix="Unable to answer project question")
-            return
-        await message.reply_text(f"Repo: `{repository_alias}`\n{self._truncate(answer, 3800)}")
 
     async def task_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_if_unauthorized(update):
@@ -705,10 +841,7 @@ class TelegramTaskBot:
         try:
             repository_alias, repo_path = self.settings.resolve_repository(requested_alias)
             task = self.task_manager.submit_task(chat.id, prompt, repository_alias=repository_alias)
-        except ValueError as exc:
-            await self._reply_error(message, exc, prefix="Unable to queue task")
-            return
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             await self._reply_error(message, exc, prefix="Unable to queue task")
             return
         await message.reply_text(
@@ -718,6 +851,98 @@ class TelegramTaskBot:
             f"Queue depth: {self.task_manager.queue_size()}\n"
             "Use /status for live progress."
         )
+
+    async def approve_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_if_unauthorized(update):
+            return
+        message = update.effective_message
+        if message is None:
+            return
+        if not context.args:
+            await message.reply_text("Usage: /approve <task-or-ask-id> [message]")
+            return
+        target_id = context.args[0].strip()
+        note = " ".join(context.args[1:]).strip()
+        resume_prompt = self._build_resume_prompt(True, note)
+
+        if target_id.startswith("task-"):
+            try:
+                task = self.task_manager.queue_task_resume(target_id, resume_prompt)
+            except (RuntimeError, ValueError) as exc:
+                await self._reply_error(message, exc, prefix="Unable to approve task")
+                return
+            await message.reply_text(
+                f"Queued resume for `{task.task_id}` on repo `{task.repository_alias}`. Use /status for progress."
+            )
+            return
+
+        if target_id.startswith("ask-"):
+            session = self.task_manager.consume_pending_session(target_id)
+            if session is None:
+                await message.reply_text(f"Unknown or expired ask confirmation id: {target_id}")
+                return
+            try:
+                repository_alias, repo_path = self.settings.resolve_repository(session.repository_alias)
+            except ValueError as exc:
+                await self._reply_error(message, exc, prefix="Unable to resume question")
+                return
+            await message.reply_text(f"Resuming question `{session.session_id}` on repo `{repository_alias}`...")
+            try:
+                result = await asyncio.to_thread(self._resume_ask_sync, repo_path, session, resume_prompt)
+                if result.confirmation_request and not result.thread_id:
+                    result.thread_id = session.codex_thread_id
+                await self._deliver_ask_result(message, session.chat_id, repository_alias, session.prompt, result)
+            except (RuntimeError, ValueError) as exc:
+                await self._reply_error(message, exc, prefix="Unable to resume question")
+            return
+
+        await message.reply_text("Unknown confirmation id. Use a `task-...` or `ask-...` id from the bot message.")
+
+    async def deny_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._reject_if_unauthorized(update):
+            return
+        message = update.effective_message
+        if message is None:
+            return
+        if not context.args:
+            await message.reply_text("Usage: /deny <task-or-ask-id> [reason]")
+            return
+        target_id = context.args[0].strip()
+        note = " ".join(context.args[1:]).strip()
+        resume_prompt = self._build_resume_prompt(False, note)
+
+        if target_id.startswith("task-"):
+            try:
+                task = self.task_manager.queue_task_resume(target_id, resume_prompt)
+            except (RuntimeError, ValueError) as exc:
+                await self._reply_error(message, exc, prefix="Unable to deny task action")
+                return
+            await message.reply_text(
+                f"Denied requested action for `{task.task_id}`. Codex will resume and look for a safer path."
+            )
+            return
+
+        if target_id.startswith("ask-"):
+            session = self.task_manager.consume_pending_session(target_id)
+            if session is None:
+                await message.reply_text(f"Unknown or expired ask confirmation id: {target_id}")
+                return
+            try:
+                repository_alias, repo_path = self.settings.resolve_repository(session.repository_alias)
+            except ValueError as exc:
+                await self._reply_error(message, exc, prefix="Unable to resume question")
+                return
+            await message.reply_text(f"Denied requested action for `{session.session_id}`. Asking Codex for a safe answer...")
+            try:
+                result = await asyncio.to_thread(self._resume_ask_sync, repo_path, session, resume_prompt)
+                if result.confirmation_request and not result.thread_id:
+                    result.thread_id = session.codex_thread_id
+                await self._deliver_ask_result(message, session.chat_id, repository_alias, session.prompt, result)
+            except (RuntimeError, ValueError) as exc:
+                await self._reply_error(message, exc, prefix="Unable to resume question")
+            return
+
+        await message.reply_text("Unknown confirmation id. Use a `task-...` or `ask-...` id from the bot message.")
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._reject_if_unauthorized(update):
@@ -769,19 +994,4 @@ class TelegramTaskBot:
 
 if __name__ == "__main__":
     TelegramTaskBot().run()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

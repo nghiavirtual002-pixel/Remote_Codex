@@ -66,6 +66,8 @@ class Settings:
     allowed_chat_ids: tuple[int, ...] = ()
     auto_stash_when_dirty: bool = False
     auto_stash_include_untracked: bool = True
+    auto_sync_main_after_task: bool = True
+    auto_sync_main_branch: str = "main"
     safe_commit_block_patterns: tuple[str, ...] = DEFAULT_SAFE_COMMIT_BLOCK_PATTERNS
     safe_commit_content_markers: tuple[str, ...] = DEFAULT_SAFE_COMMIT_CONTENT_MARKERS
     safe_commit_content_max_bytes: int = 200_000
@@ -261,6 +263,8 @@ def load_settings() -> Settings:
         allowed_chat_ids=_parse_allowed_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")),
         auto_stash_when_dirty=_parse_bool(os.getenv("AUTO_STASH_WHEN_DIRTY", ""), default=False),
         auto_stash_include_untracked=_parse_bool(os.getenv("AUTO_STASH_INCLUDE_UNTRACKED", ""), default=True),
+        auto_sync_main_after_task=_parse_bool(os.getenv("AUTO_SYNC_MAIN_AFTER_TASK", ""), default=True),
+        auto_sync_main_branch=os.getenv("AUTO_SYNC_MAIN_BRANCH", "main").strip() or "main",
         safe_commit_block_patterns=_parse_pattern_list(
             os.getenv("SAFE_COMMIT_BLOCK_PATTERNS", ""),
             DEFAULT_SAFE_COMMIT_BLOCK_PATTERNS,

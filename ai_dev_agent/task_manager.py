@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import queue
@@ -32,12 +32,34 @@ class TaskRecord:
     last_diff: Optional[str] = None
     output_tail: list[str] = field(default_factory=list)
     stop_requested: bool = False
+    codex_thread_id: Optional[str] = None
+    pending_confirmation: Optional[str] = None
+    resume_prompt: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class PendingCodexSession:
+    session_id: str
+    chat_id: int
+    repository_alias: str
+    kind: str
+    prompt: str
+    codex_thread_id: str
+    pending_confirmation: str
+    created_at: str = field(default_factory=_utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PendingCodexSession":
         return cls(**data)
 
 
@@ -49,6 +71,7 @@ class TaskManager:
         self._task_queue: queue.Queue[str] = queue.Queue(maxsize=queue_maxsize)
         self._notification_queue: queue.Queue[tuple[int, str]] = queue.Queue()
         self._tasks: dict[str, TaskRecord] = {}
+        self._pending_sessions: dict[str, PendingCodexSession] = {}
         self._chat_repo_aliases: dict[str, str] = {}
         self._current_task_id: Optional[str] = None
         self._last_task_id: Optional[str] = None
@@ -66,6 +89,8 @@ class TaskManager:
                 task.error = "Marked failed after service restart."
                 task.progress = "Failed after restart"
             self._tasks[task_id] = task
+        for session_id, payload in raw.get("pending_sessions", {}).items():
+            self._pending_sessions[session_id] = PendingCodexSession.from_dict(payload)
         self._chat_repo_aliases = {
             str(chat_id): str(alias)
             for chat_id, alias in raw.get("chat_repo_aliases", {}).items()
@@ -76,6 +101,9 @@ class TaskManager:
     def _persist(self) -> None:
         payload = {
             "tasks": {task_id: task.to_dict() for task_id, task in self._tasks.items()},
+            "pending_sessions": {
+                session_id: session.to_dict() for session_id, session in self._pending_sessions.items()
+            },
             "chat_repo_aliases": self._chat_repo_aliases,
             "last_task_id": self._last_task_id,
         }
@@ -111,11 +139,12 @@ class TaskManager:
             if task is None:
                 return None
             task.status = "running"
-            task.started_at = _utc_now()
+            if task.started_at is None:
+                task.started_at = _utc_now()
             task.progress = f"Starting worker for repo {task.repository_alias}"
             self._current_task_id = task_id
             self._persist()
-            return task
+            return TaskRecord.from_dict(task.to_dict())
 
     def update_progress(self, task_id: str, progress: str) -> None:
         with self._lock:
@@ -146,6 +175,55 @@ class TaskManager:
             task.branch_name = branch_name
             self._persist()
 
+    def set_codex_thread(self, task_id: str, thread_id: str | None) -> None:
+        if not thread_id:
+            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.codex_thread_id = thread_id
+            self._persist()
+
+    def mark_waiting_input(self, task_id: str, question: str, thread_id: str | None) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.status = "waiting_input"
+            task.progress = "Waiting for user confirmation"
+            task.pending_confirmation = question
+            task.resume_prompt = None
+            if thread_id:
+                task.codex_thread_id = thread_id
+            self._current_task_id = None
+            self._last_task_id = task_id
+            self._persist()
+
+    def queue_task_resume(self, task_id: str, resume_prompt: str) -> TaskRecord:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise ValueError(f"Unknown task id: {task_id}")
+            if task.status != "waiting_input" or not task.codex_thread_id:
+                raise RuntimeError(f"Task {task_id} is not waiting for confirmation")
+            task.status = "queued"
+            task.progress = "Resume queued"
+            task.resume_prompt = resume_prompt.strip()
+            task.pending_confirmation = None
+            task.stop_requested = False
+            self._persist()
+            try:
+                self._task_queue.put_nowait(task_id)
+            except queue.Full as exc:
+                task.status = "waiting_input"
+                task.progress = "Waiting for user confirmation"
+                task.pending_confirmation = "Queue is full while trying to resume task."
+                task.resume_prompt = None
+                self._persist()
+                raise RuntimeError("Task queue is full") from exc
+            return TaskRecord.from_dict(task.to_dict())
+
     def mark_completed(self, task_id: str, summary: str, commit_hash: Optional[str]) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
@@ -157,6 +235,8 @@ class TaskManager:
             task.summary = summary
             task.commit_hash = commit_hash
             task.error = None
+            task.pending_confirmation = None
+            task.resume_prompt = None
             self._current_task_id = None
             self._last_task_id = task_id
             self._persist()
@@ -170,6 +250,8 @@ class TaskManager:
             task.finished_at = _utc_now()
             task.progress = "Failed"
             task.error = error
+            task.pending_confirmation = None
+            task.resume_prompt = None
             self._current_task_id = None
             self._last_task_id = task_id
             self._persist()
@@ -183,6 +265,8 @@ class TaskManager:
             task.finished_at = _utc_now()
             task.progress = "Stopped"
             task.error = reason
+            task.pending_confirmation = None
+            task.resume_prompt = None
             self._current_task_id = None
             self._last_task_id = task_id
             self._persist()
@@ -225,12 +309,59 @@ class TaskManager:
                 return None
             return TaskRecord.from_dict(task.to_dict())
 
+    def get_task(self, task_id: str) -> Optional[TaskRecord]:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return TaskRecord.from_dict(task.to_dict())
+
     def is_repo_busy(self, repository_alias: str) -> bool:
         with self._lock:
-            if not self._current_task_id:
-                return False
-            task = self._tasks.get(self._current_task_id)
-            return bool(task and task.repository_alias == repository_alias and task.status == "running")
+            for task in self._tasks.values():
+                if task.repository_alias != repository_alias:
+                    continue
+                if task.status in {"running", "waiting_input"}:
+                    return True
+            return False
+
+    def create_pending_session(
+        self,
+        chat_id: int,
+        repository_alias: str,
+        kind: str,
+        prompt: str,
+        codex_thread_id: str,
+        pending_confirmation: str,
+    ) -> PendingCodexSession:
+        session = PendingCodexSession(
+            session_id=f"{kind}-{int(time.time() * 1000)}",
+            chat_id=chat_id,
+            repository_alias=repository_alias,
+            kind=kind,
+            prompt=prompt.strip(),
+            codex_thread_id=codex_thread_id,
+            pending_confirmation=pending_confirmation,
+        )
+        with self._lock:
+            self._pending_sessions[session.session_id] = session
+            self._persist()
+        return session
+
+    def get_pending_session(self, session_id: str) -> Optional[PendingCodexSession]:
+        with self._lock:
+            session = self._pending_sessions.get(session_id)
+            if session is None:
+                return None
+            return PendingCodexSession.from_dict(session.to_dict())
+
+    def consume_pending_session(self, session_id: str) -> Optional[PendingCodexSession]:
+        with self._lock:
+            session = self._pending_sessions.pop(session_id, None)
+            self._persist()
+            if session is None:
+                return None
+            return session
 
     def status_report(self) -> str:
         with self._lock:
@@ -257,7 +388,7 @@ class TaskManager:
                     f"Last task: {task.task_id}\n"
                     f"Repo: {task.repository_alias}\n"
                     f"Status: {task.status}\n"
-                    f"Summary: {task.summary or task.error or 'N/A'}\n"
+                    f"Summary: {task.summary or task.pending_confirmation or task.error or 'N/A'}\n"
                     f"Queued: {self._task_queue.qsize()}"
                 )
             return f"No task running.\nQueued: {self._task_queue.qsize()}"
@@ -290,3 +421,4 @@ class TaskManager:
             except queue.Empty:
                 break
         return items
+
