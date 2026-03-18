@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
+import re
 from typing import Callable, Optional
 
 try:
@@ -28,13 +29,33 @@ class GitError(RuntimeError):
     pass
 
 
+_LINE_ENDING_WARNING_RE = re.compile(
+    r"warning: (?:LF|CRLF) will be replaced by (?:LF|CRLF) in [^\r\n]+\r?\n"
+    r"The file will have its original line endings in your working directory\r?\n?",
+)
+
+
+def _strip_line_ending_warnings(output: str) -> str:
+    return _LINE_ENDING_WARNING_RE.sub("", output)
+
+
 class GitManager:
     def __init__(self, repo_path: Path, remote: str = "origin") -> None:
         self.repo_path = repo_path
         self.remote = remote
 
     def _git(self, args: list[str], should_stop: Callable[[], bool]) -> CommandResult:
-        return run_command(["git", *args], cwd=self.repo_path, should_stop=should_stop)
+        result = run_command(["git", *args], cwd=self.repo_path, should_stop=should_stop)
+        cleaned_output = _strip_line_ending_warnings(result.output)
+        if cleaned_output == result.output:
+            return result
+        return CommandResult(
+            command=result.command,
+            returncode=result.returncode,
+            output=cleaned_output,
+            duration_seconds=result.duration_seconds,
+            stopped=result.stopped,
+        )
 
     def _list_paths(self, args: list[str], should_stop: Callable[[], bool], error_message: str) -> list[str]:
         result = self._git(args, should_stop=should_stop)
@@ -352,3 +373,4 @@ class GitManager:
         if len(diff) > max_chars:
             return diff[:max_chars] + "\n... (truncated)"
         return diff
+
